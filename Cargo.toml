@@ -4,6 +4,7 @@ members = [
     "crates/adapters",
     "crates/strategy",
     "crates/bridge",
+    "crates/settlement",
     "bin/solver-cli",
     "bin/solver-daemon",
 ]
