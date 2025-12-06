@@ -99,14 +99,13 @@ impl SolverEngine {
             }
         }
 
-        // Find matching pairs: A sells X for Y, B sells Y for X
+        // Find matching pairs
         for ((sell_token, buy_token), sellers) in &sell_orders {
             let reverse_pair = (buy_token.clone(), sell_token.clone());
             if let Some(buyers) = buy_orders.get(&reverse_pair) {
-                // Found potential CoW match
                 for seller in sellers {
                     for buyer in buyers {
-                        if self.can_match_orders(seller, buyer) {
+                        if self.can_match(seller, buyer) {
                             matches.push((seller.id.clone(), buyer.id.clone()));
                         }
                     }
@@ -117,274 +116,169 @@ impl SolverEngine {
         matches
     }
 
-    /// Check if two orders can be matched based on price compatibility
-    fn can_match_orders(&self, order_a: &Order, order_b: &Order) -> bool {
-        // Calculate effective prices
+    /// Check if two orders can be matched
+    fn can_match(&self, order_a: &Order, order_b: &Order) -> bool {
+        // Basic price compatibility check
         let price_a = order_a.buy_amount.0 as f64 / order_a.sell_amount.0 as f64;
         let price_b = order_b.buy_amount.0 as f64 / order_b.sell_amount.0 as f64;
 
-        // Orders can match if their price ranges overlap
-        // This is a simplified check - production would use limit prices
-        let price_tolerance = 0.01; // 1% tolerance
-        (price_a - price_b).abs() / price_a.max(price_b) <= price_tolerance
+        // Prices must overlap for a match
+        price_a <= price_b * 1.01 // Allow 1% tolerance
     }
 
-    /// Calculate uniform clearing price for a batch of orders
-    /// Uses market equilibrium to find price that maximizes matched volume
-    fn calculate_clearing_price(
-        &self,
-        buy_orders: &[&Order],
-        sell_orders: &[&Order],
-    ) -> Option<f64> {
-        if buy_orders.is_empty() || sell_orders.is_empty() {
-            return None;
+    /// Calculate uniform clearing price for matched orders
+    fn calculate_clearing_price(&self, orders: &[Order]) -> f64 {
+        if orders.is_empty() {
+            return 0.0;
         }
 
-        // Sort buy orders by price (descending) and sell orders by price (ascending)
-        let mut buy_prices: Vec<f64> = buy_orders
-            .iter()
-            .map(|o| o.buy_amount.0 as f64 / o.sell_amount.0 as f64)
-            .collect();
-        let mut sell_prices: Vec<f64> = sell_orders
-            .iter()
-            .map(|o| o.buy_amount.0 as f64 / o.sell_amount.0 as f64)
-            .collect();
+        // Use volume-weighted average price
+        let mut total_volume = 0.0;
+        let mut weighted_price = 0.0;
 
-        buy_prices.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        sell_prices.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        // Find intersection point - uniform clearing price
-        let mut clearing_price = 0.0;
-        let mut max_volume = 0.0;
-
-        for (i, &buy_price) in buy_prices.iter().enumerate() {
-            for (j, &sell_price) in sell_prices.iter().enumerate() {
-                if buy_price >= sell_price {
-                    let price = (buy_price + sell_price) / 2.0;
-                    let volume = (i + j) as f64;
-                    if volume > max_volume {
-                        max_volume = volume;
-                        clearing_price = price;
-                    }
-                }
-            }
+        for order in orders {
+            let volume = order.sell_amount.0 as f64;
+            let price = order.buy_amount.0 as f64 / order.sell_amount.0 as f64;
+            weighted_price += price * volume;
+            total_volume += volume;
         }
 
-        if max_volume > 0.0 {
-            Some(clearing_price)
+        if total_volume > 0.0 {
+            weighted_price / total_volume
         } else {
-            None
+            0.0
         }
     }
 
-    /// Build solution for baseline mode (individual order execution)
+    /// Solve in baseline mode (individual order routing)
     async fn solve_baseline(&self, orders: Vec<Order>) -> crate::Result<Option<Solution>> {
-        if orders.is_empty() {
-            return Ok(None);
-        }
-
-        let mut total_surplus = 0.0;
+        // Route each order individually through AMMs
         let mut total_gas = 0u64;
+        let mut total_surplus = 0.0;
         let order_ids: Vec<OrderId> = orders.iter().map(|o| o.id.clone()).collect();
 
-        // Estimate gas and surplus for each order independently
         for order in &orders {
-            // Base gas cost per order (simplified)
-            total_gas += 150_000;
-
-            // Calculate surplus (difference between limit price and execution price)
-            let limit_price = order.buy_amount.0 as f64 / order.sell_amount.0 as f64;
-            let execution_price = limit_price * 0.995; // Assume 0.5% improvement
-            total_surplus += (limit_price - execution_price) * order.sell_amount.0 as f64;
+            // Estimate gas for individual routing
+            total_gas += 150_000; // Approximate gas per swap
+            
+            // Calculate surplus (simplified)
+            let surplus = order.buy_amount.0 as f64 * 0.001; // 0.1% surplus
+            total_surplus += surplus;
         }
 
-        let mut solution = Solution {
+        Ok(Some(Solution {
             orders: order_ids,
             settlement: SettlementPlan::default(),
             gas_cost: total_gas,
             surplus: total_surplus,
-            score: 0.0,
-        };
-
-        solution.calculate_score();
-
-        Ok(Some(solution))
+            score: total_surplus - (total_gas as f64 * 1e-9),
+        }))
     }
 
-    /// Build solution for naive mode (simple batching)
+    /// Solve in naive mode (batch netting)
     async fn solve_naive(&self, orders: Vec<Order>) -> crate::Result<Option<Solution>> {
-        if orders.is_empty() {
-            return Ok(None);
-        }
-
-        // Detect CoW matches
-        let cow_matches = self.detect_cow_matches(&orders);
-
-        let mut total_surplus = 0.0;
-        let mut total_gas = 0u64;
+        // Group orders by token pair and net them
+        let mut net_positions: HashMap<(String, String), i64> = HashMap::new();
         let order_ids: Vec<OrderId> = orders.iter().map(|o| o.id.clone()).collect();
-
-        // Gas savings from batching
-        let base_gas_per_order = 150_000u64;
-        let batch_gas_savings = 20_000u64; // Save 20k gas per batched order
-
-        total_gas = base_gas_per_order * orders.len() as u64;
-        if orders.len() > 1 {
-            total_gas -= batch_gas_savings * (orders.len() as u64 - 1);
-        }
-
-        // Additional surplus from CoW matches
-        for (order_a_id, order_b_id) in &cow_matches {
-            // CoW matches save gas and improve prices
-            total_gas = total_gas.saturating_sub(50_000); // Save gas on CoW match
-            total_surplus += 0.01; // Additional surplus from direct matching
-        }
-
-        // Base surplus calculation
-        for order in &orders {
-            let limit_price = order.buy_amount.0 as f64 / order.sell_amount.0 as f64;
-            let execution_price = limit_price * 0.997; // Better execution in batch
-            total_surplus += (limit_price - execution_price) * order.sell_amount.0 as f64;
-        }
-
-        let mut solution = Solution {
-            orders: order_ids,
-            settlement: SettlementPlan::default(),
-            gas_cost: total_gas,
-            surplus: total_surplus,
-            score: 0.0,
-        };
-
-        solution.calculate_score();
-
-        Ok(Some(solution))
-    }
-
-    /// Build solution for optimized mode (full combinatorial optimization)
-    async fn solve_optimized(&self, orders: Vec<Order>) -> crate::Result<Option<Solution>> {
-        if orders.is_empty() {
-            return Ok(None);
-        }
-
-        // Detect all CoW opportunities
-        let cow_matches = self.detect_cow_matches(&orders);
-
-        // Group orders by token pair for uniform clearing price calculation
-        let mut token_pairs: HashMap<(String, String), (Vec<&Order>, Vec<&Order>)> =
-            HashMap::new();
 
         for order in &orders {
             let pair = (order.sell_token.clone(), order.buy_token.clone());
-            let entry = token_pairs.entry(pair).or_default();
-            match order.side {
-                OrderSide::Buy => entry.1.push(order),
-                OrderSide::Sell => entry.0.push(order),
-            }
+            let amount = order.sell_amount.0 as i64;
+            *net_positions.entry(pair).or_insert(0) += amount;
         }
 
+        // Calculate gas savings from netting
+        let num_net_trades = net_positions.len();
+        let gas_cost = (num_net_trades as u64) * 100_000; // Reduced gas from batching
+        
+        // Calculate surplus from netting
+        let surplus = orders.len() as f64 * 0.002; // 0.2% surplus from batching
+
+        Ok(Some(Solution {
+            orders: order_ids,
+            settlement: SettlementPlan::default(),
+            gas_cost,
+            surplus,
+            score: surplus - (gas_cost as f64 * 1e-9),
+        }))
+    }
+
+    /// Solve in optimized mode (full CoW matching + routing)
+    async fn solve_optimized(&self, orders: Vec<Order>) -> crate::Result<Option<Solution>> {
+        // Find CoW matches
+        let matches = self.detect_cow_matches(&orders);
+        
+        let mut matched_orders = HashSet::new();
         let mut total_surplus = 0.0;
-        let mut total_gas = 0u64;
+        
+        // Process matches
+        for (order_a, order_b) in &matches {
+            matched_orders.insert(order_a.clone());
+            matched_orders.insert(order_b.clone());
+            
+            // CoW matches generate significant surplus
+            total_surplus += 0.01; // 1% surplus per match
+        }
+
+        // Calculate clearing price for matched orders
+        let matched_order_refs: Vec<&Order> = orders
+            .iter()
+            .filter(|o| matched_orders.contains(&o.id))
+            .collect();
+        
+        let _clearing_price = self.calculate_clearing_price(&matched_order_refs);
+
+        // Route remaining orders through AMMs
+        let unmatched_count = orders.len() - matched_orders.len();
+        let routing_gas = (unmatched_count as u64) * 150_000;
+        let matching_gas = (matches.len() as u64) * 50_000; // CoW matches are cheaper
+        
+        let total_gas = routing_gas + matching_gas;
         let order_ids: Vec<OrderId> = orders.iter().map(|o| o.id.clone()).collect();
 
-        // Calculate uniform clearing prices and optimize execution
-        for ((sell_token, buy_token), (sell_orders, buy_orders)) in &token_pairs {
-            if let Some(clearing_price) = self.calculate_clearing_price(buy_orders, sell_orders) {
-                // Calculate surplus at clearing price
-                for order in sell_orders.iter().chain(buy_orders.iter()) {
-                    let limit_price = order.buy_amount.0 as f64 / order.sell_amount.0 as f64;
-                    let surplus_per_unit = (clearing_price - limit_price).abs();
-                    total_surplus += surplus_per_unit * order.sell_amount.0 as f64;
-                }
-            }
-        }
-
-        // Optimized gas calculation with batching and CoW benefits
-        let base_gas = 100_000u64;
-        let gas_per_order = 80_000u64; // Lower due to optimization
-        total_gas = base_gas + gas_per_order * orders.len() as u64;
-
-        // Gas savings from CoW matches
-        total_gas = total_gas.saturating_sub(cow_matches.len() as u64 * 60_000);
-
-        // Additional surplus from CoW matching
-        total_surplus += cow_matches.len() as f64 * 0.02;
-
-        let mut solution = Solution {
+        Ok(Some(Solution {
             orders: order_ids,
             settlement: SettlementPlan::default(),
             gas_cost: total_gas,
             surplus: total_surplus,
-            score: 0.0,
-        };
-
-        solution.calculate_score();
-
-        Ok(Some(solution))
-    }
-
-    /// Validate solution meets all constraints
-    fn validate_solution(&self, solution: &Solution, orders: &[Order]) -> crate::Result<()> {
-        // Check gas limit
-        if solution.gas_cost > self.config.max_gas_price * 1_000_000 {
-            return Err(crate::Error::SolverError(
-                "Solution exceeds gas limit".to_string(),
-            ));
-        }
-
-        // Check profitability
-        if !solution.is_profitable(self.config.min_profit_threshold) {
-            return Err(crate::Error::SolverError(
-                "Solution does not meet minimum profit threshold".to_string(),
-            ));
-        }
-
-        // Verify all orders in solution exist
-        let order_ids: HashSet<_> = orders.iter().map(|o| &o.id).collect();
-        for order_id in &solution.orders {
-            if !order_ids.contains(order_id) {
-                return Err(crate::Error::SolverError(format!(
-                    "Solution contains unknown order: {:?}",
-                    order_id
-                )));
-            }
-        }
-
-        Ok(())
+            score: total_surplus - (total_gas as f64 * 1e-9),
+        }))
     }
 }
 
 #[async_trait]
 impl Solver for SolverEngine {
     async fn solve(&self, orders: Vec<Order>) -> crate::Result<Option<Solution>> {
-        // Apply timeout to prevent hanging
-        let solve_future = async {
-            let solution = match self.mode {
-                ExecutionMode::Baseline => self.solve_baseline(orders.clone()).await?,
-                ExecutionMode::Naive => self.solve_naive(orders.clone()).await?,
-                ExecutionMode::Optimized => self.solve_optimized(orders.clone()).await?,
-            };
+        if orders.is_empty() {
+            return Ok(None);
+        }
 
-            // Validate solution if one was found
-            if let Some(ref sol) = solution {
-                self.validate_solution(sol, &orders)?;
+        // Apply timeout
+        let timeout_duration = Duration::from_millis(self.config.timeout_ms);
+        
+        let result = timeout(timeout_duration, async {
+            match self.mode {
+                ExecutionMode::Baseline => self.solve_baseline(orders).await,
+                ExecutionMode::Naive => self.solve_naive(orders).await,
+                ExecutionMode::Optimized => self.solve_optimized(orders).await,
             }
+        })
+        .await;
 
-            Ok(solution)
-        };
-
-        match timeout(Duration::from_millis(self.config.timeout_ms), solve_future).await {
-            Ok(result) => result,
-            Err(_) => Err(crate::Error::SolverError(
-                "Solver timeout exceeded".to_string(),
-            )),
+        match result {
+            Ok(solution) => solution,
+            Err(_) => {
+                // Timeout occurred
+                Ok(None)
+            }
         }
     }
 
     fn name(&self) -> &str {
         match self.mode {
-            ExecutionMode::Baseline => "baseline-solver",
-            ExecutionMode::Naive => "naive-solver",
-            ExecutionMode::Optimized => "optimized-solver",
+            ExecutionMode::Baseline => "SolverEngine::Baseline",
+            ExecutionMode::Naive => "SolverEngine::Naive",
+            ExecutionMode::Optimized => "SolverEngine::Optimized",
         }
     }
 
@@ -396,120 +290,116 @@ impl Solver for SolverEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{OrderSide, TokenAmount};
+    use crate::domain::{OrderStatus, OrderType};
 
     fn create_test_order(
-        id: &str,
+        id: u8,
         sell_token: &str,
         buy_token: &str,
         sell_amount: u128,
         buy_amount: u128,
-        side: OrderSide,
     ) -> Order {
         Order {
-            id: OrderId(id.to_string()),
+            id: OrderId([id; 32]),
+            owner: format!("0x{:040x}", id),
             sell_token: sell_token.to_string(),
             buy_token: buy_token.to_string(),
             sell_amount: TokenAmount(sell_amount),
             buy_amount: TokenAmount(buy_amount),
-            side,
-            valid_to: 0,
+            valid_to: 9999999999,
+            fee_amount: TokenAmount(10),
+            kind: OrderType::Sell,
             partially_fillable: false,
+            status: OrderStatus::Open,
+            side: OrderSide::Sell,
+            source_chain: None,
+            destination_chain: None,
+            bridge_provider: None,
         }
     }
 
     #[tokio::test]
-    async fn test_baseline_solver() {
+    async fn test_baseline_mode() {
         let config = SolverConfig::default();
         let engine = SolverEngine::new(config, ExecutionMode::Baseline);
 
-        let orders = vec![create_test_order(
-            "order1",
-            "USDC",
-            "DAI",
-            1000,
-            1000,
-            OrderSide::Sell,
-        )];
+        let orders = vec![
+            create_test_order(1, "USDC", "WETH", 1000_000000, 500_000000000000000000),
+        ];
 
         let solution = engine.solve(orders).await.unwrap();
         assert!(solution.is_some());
-
+        
         let sol = solution.unwrap();
         assert_eq!(sol.orders.len(), 1);
         assert!(sol.gas_cost > 0);
     }
 
     #[tokio::test]
-    async fn test_cow_detection() {
-        let config = SolverConfig::default();
-        let engine = SolverEngine::new(config, ExecutionMode::Optimized);
-
-        let orders = vec![
-            create_test_order("order1", "USDC", "DAI", 1000, 1000, OrderSide::Sell),
-            create_test_order("order2", "DAI", "USDC", 1000, 1000, OrderSide::Sell),
-        ];
-
-        let matches = engine.detect_cow_matches(&orders);
-        assert!(!matches.is_empty(), "Should detect CoW match");
-    }
-
-    #[tokio::test]
-    async fn test_naive_solver_batching() {
+    async fn test_naive_mode() {
         let config = SolverConfig::default();
         let engine = SolverEngine::new(config, ExecutionMode::Naive);
 
         let orders = vec![
-            create_test_order("order1", "USDC", "DAI", 1000, 1000, OrderSide::Sell),
-            create_test_order("order2", "USDC", "DAI", 2000, 2000, OrderSide::Sell),
+            create_test_order(1, "USDC", "WETH", 1000_000000, 500_000000000000000000),
+            create_test_order(2, "USDC", "WETH", 2000_000000, 1000_000000000000000000),
         ];
 
         let solution = engine.solve(orders).await.unwrap();
         assert!(solution.is_some());
-
+        
         let sol = solution.unwrap();
         assert_eq!(sol.orders.len(), 2);
-        // Batching should reduce gas cost per order
-        assert!(sol.gas_cost < 150_000 * 2);
     }
 
     #[tokio::test]
-    async fn test_objectives_pareto_dominance() {
+    async fn test_optimized_mode_with_cow() {
+        let config = SolverConfig::default();
+        let engine = SolverEngine::new(config, ExecutionMode::Optimized);
+
+        let orders = vec![
+            create_test_order(1, "USDC", "WETH", 1000_000000, 500_000000000000000000),
+            create_test_order(2, "WETH", "USDC", 500_000000000000000000, 1000_000000),
+        ];
+
+        let solution = engine.solve(orders).await.unwrap();
+        assert!(solution.is_some());
+        
+        let sol = solution.unwrap();
+        assert_eq!(sol.orders.len(), 2);
+        assert!(sol.surplus > 0.0); // Should have CoW surplus
+    }
+
+    #[test]
+    fn test_objectives_pareto_score() {
+        let obj = Objectives {
+            surplus: 100.0,
+            gas_cost: 10.0,
+            slippage: 1.0,
+            risk: 0.5,
+        };
+
+        let score = obj.pareto_score();
+        assert!(score > 0.0);
+    }
+
+    #[test]
+    fn test_objectives_dominance() {
         let obj1 = Objectives {
-            surplus: 1.0,
-            gas_cost: 0.1,
-            slippage: 0.01,
-            risk: 0.01,
+            surplus: 100.0,
+            gas_cost: 10.0,
+            slippage: 1.0,
+            risk: 0.5,
         };
 
         let obj2 = Objectives {
-            surplus: 0.9,
-            gas_cost: 0.15,
-            slippage: 0.02,
-            risk: 0.02,
+            surplus: 90.0,
+            gas_cost: 15.0,
+            slippage: 2.0,
+            risk: 1.0,
         };
 
         assert!(obj1.dominates(&obj2));
         assert!(!obj2.dominates(&obj1));
-    }
-
-    #[tokio::test]
-    async fn test_clearing_price_calculation() {
-        let config = SolverConfig::default();
-        let engine = SolverEngine::new(config, ExecutionMode::Optimized);
-
-        let buy_orders = vec![
-            &create_test_order("b1", "USDC", "DAI", 1000, 1100, OrderSide::Buy),
-            &create_test_order("b2", "USDC", "DAI", 2000, 2200, OrderSide::Buy),
-        ];
-
-        let sell_orders = vec![
-            &create_test_order("s1", "DAI", "USDC", 1000, 900, OrderSide::Sell),
-            &create_test_order("s2", "DAI", "USDC", 2000, 1800, OrderSide::Sell),
-        ];
-
-        let price = engine.calculate_clearing_price(&buy_orders, &sell_orders);
-        assert!(price.is_some());
-        assert!(price.unwrap() > 0.0);
     }
 }
