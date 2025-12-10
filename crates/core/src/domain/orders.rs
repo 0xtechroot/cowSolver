@@ -209,3 +209,90 @@ mod tests {
         assert!(order.validate().is_ok());
     }
 }
+
+#[cfg(test)]
+mod extra_orders_tests {
+    use super::*;
+    use serde_json;
+
+    fn base_order() -> Order {
+        Order {
+            id: OrderId([1u8; 32]),
+            owner: Address::zero(),
+            sell_token: Address::from_low_u64_be(0x1),
+            buy_token: Address::from_low_u64_be(0x2),
+            sell_amount: U256::from(100u64),
+            buy_amount: U256::from(200u64),
+            valid_to: 1_640_000_000u32,
+            fee_amount: U256::from(1u64),
+            kind: OrderType::Sell,
+            partially_fillable: true,
+            status: OrderStatus::Open,
+            source_chain: None,
+            destination_chain: None,
+            bridge_provider: None,
+        }
+    }
+
+    #[test]
+    fn limit_price_returns_zero_when_sell_amount_zero() {
+        let mut o = base_order();
+        o.sell_amount = U256::zero();
+        o.buy_amount = U256::from(1000u64);
+        assert_eq!(o.limit_price(), 0.0);
+    }
+
+    #[test]
+    fn can_fill_at_price_edge_cases_buy_and_sell() {
+        let mut buy_order = base_order();
+        buy_order.kind = OrderType::Buy;
+        buy_order.sell_amount = U256::from(2u64);
+        buy_order.buy_amount = U256::from(5u64); // limit_price = 2.5
+        assert!(buy_order.can_fill_at_price(2.5)); // equal is allowed
+        assert!(buy_order.can_fill_at_price(2.0));
+        assert!(!buy_order.can_fill_at_price(3.0));
+
+        let mut sell_order = base_order();
+        sell_order.kind = OrderType::Sell;
+        sell_order.sell_amount = U256::from(4u64);
+        sell_order.buy_amount = U256::from(10u64); // limit_price = 2.5
+        assert!(sell_order.can_fill_at_price(2.5)); // equal is allowed
+        assert!(sell_order.can_fill_at_price(3.0));
+        assert!(!sell_order.can_fill_at_price(2.0));
+    }
+
+    #[test]
+    fn is_cross_chain_false_when_one_chain_missing() {
+        let mut o = base_order();
+        o.source_chain = Some(ChainId::Ethereum);
+        o.destination_chain = None;
+        assert!(!o.is_cross_chain());
+
+        o.source_chain = None;
+        o.destination_chain = Some(ChainId::Arbitrum);
+        assert!(!o.is_cross_chain());
+    }
+
+    #[test]
+    fn validate_rejects_valid_to_zero() {
+        let mut o = base_order();
+        o.valid_to = 0;
+        let res = o.validate();
+        assert!(res.is_err());
+        let msg = res.err().unwrap();
+        assert!(msg.contains("Valid_to"));
+    }
+
+    #[test]
+    fn order_serde_roundtrip() {
+        let mut o = base_order();
+        o.source_chain = Some(ChainId::Optimism);
+        o.destination_chain = Some(ChainId::Arbitrum);
+        o.bridge_provider = Some("TestBridge".to_string());
+        let s = serde_json::to_string(&o).expect("serialize");
+        let back: Order = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.id.0, o.id.0);
+        assert_eq!(back.source_chain, o.source_chain);
+        assert_eq!(back.bridge_provider, o.bridge_provider);
+    }
+}
